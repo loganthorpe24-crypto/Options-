@@ -1,0 +1,89 @@
+# =============================================================================
+# QQQ 0DTE options strategy - configuration
+#
+# Source: Instagram reel by @nickafischer (Nov 20, 2026).
+#
+#   [CREATOR]    a rule the creator stated. If you change one, you are no
+#                longer running his strategy; the bot logs a WARNING.
+#   [ASSUMPTION] the creator did NOT specify this. The value is a default
+#                chosen for this code, and every start logs it.
+#
+# API keys are NEVER read from this file. Use the environment variables
+# APCA_API_KEY_ID and APCA_API_SECRET_KEY.
+# Nothing in this file can turn on live trading. Live orders need the
+# --live CLI flag.
+#
+# The trailing-stop MEASUREMENT BASIS is deliberately not in this file. It is
+# the constant TRAIL_MEASUREMENT_BASIS at the top of qqq0dte/exits.py.
+# =============================================================================
+
+strategy:
+  underlying: QQQ                    # [CREATOR] QQQ only, 0DTE options only
+  session_open_time: "09:30"         # [CREATOR] all times are US/Eastern
+  opening_range_minutes: 15          # [CREATOR] 9:30-9:45 = first 15 one-minute bars
+  noise_lookback_days: 20            # [CREATOR] mean absolute move per minute over the last 20 trading days
+  noise_multiplier: 1.25             # [CREATOR] band = open +/- 1.25 x avg move for that minute
+  atr_period_days: 5                 # [CREATOR] 5-day ATR, simple average of True Range (daily bars)
+  atr_breakout_multiplier: 0.3       # [CREATOR] close < OR low - 0.3*ATR (puts) / close > OR high + 0.3*ATR (calls)
+  entry_window_start: "10:00"        # [CREATOR]
+  entry_window_end: "14:00"          # [CREATOR]
+  check_interval_minutes: 10         # [CREATOR] check on every 10-minute close; first signal only
+  hard_exit_time: "15:45"            # [CREATOR] exit at market, no exceptions
+  trail_arm_threshold: 4.0           # [CREATOR] arm the trailing stop at +4 (units come from TRAIL_MEASUREMENT_BASIS)
+  trail_giveback_fraction: 0.5       # [CREATOR] once armed, exit after giving back 50% of the peak favorable move
+  # One trade per day, no re-entry, and "first signal only" are [CREATOR] rules
+  # and are hard-coded, not configurable.
+
+assumptions:
+  # --- Option selection & sizing ---------------------------------------------
+  strike_selection: atm              # [ASSUMPTION] STRIKE_SELECTION: atm | itm | otm
+                                     #   atm: listed 0DTE strike closest to QQQ's price at the signal close
+                                     #   itm / otm: move `strike_offset` listed strikes in/out of the money from ATM
+  strike_offset: 0                   # [ASSUMPTION] used only when strike_selection is itm or otm
+  atm_tie_break: lower               # [ASSUMPTION] lower | higher, for when QQQ sits exactly halfway between two strikes
+  contracts: 10                      # [ASSUMPTION] position size (the creator's example used 10; he gives no sizing rule)
+
+  # --- Indicator definitions -------------------------------------------------
+  session_open_price: first_bar_open # [ASSUMPTION] "the open" = open of the 9:30 one-minute bar
+  noise_move_units: dollars          # [ASSUMPTION] dollars: move = |price - open| in $, band = open +/- 1.25*avg
+                                     #              percent: move = |price/open - 1|, band = open*(1 +/- 1.25*avg)
+  vwap_price: hlc3                   # [ASSUMPTION] per-bar price for VWAP: hlc3 (=(H+L+C)/3) | bar_vwap (Alpaca's vw) | close
+  atr_source: alpaca_daily           # [ASSUMPTION] alpaca_daily: Alpaca 1Day bars
+                                     #              rth_from_minutes: daily OHLC built from 9:30-16:00 one-minute bars
+  entry_window_end_inclusive: true   # [ASSUMPTION] the 2:00pm check counts (checks at 10:00, 10:10, ..., 14:00)
+
+  # --- Trailing stop mechanics (threshold and giveback are CREATOR rules) ----
+  trail_check_interval_minutes: 1    # [ASSUMPTION] evaluate the trailing stop on every 1-minute close of QQQ
+
+  # --- Backtest fills --------------------------------------------------------
+  fill_model: next_bar_open          # [ASSUMPTION] next_bar_open: open of the option's first 1-min bar at/after the decision time
+                                     #              signal_bar_close: close of the option's last 1-min bar ending at/before it
+  option_fill_max_staleness_minutes: 5   # [ASSUMPTION] if the option has no trade within this window, the trade is
+                                         # flagged as a data error. No price is ever made up.
+  slippage_per_share: 0.00           # [ASSUMPTION] added to the entry price and subtracted from the exit price ($/share, x100 per contract)
+  commission_per_contract: 0.00      # [ASSUMPTION] per contract, per side
+
+  # --- Calendar --------------------------------------------------------------
+  early_close_policy: skip           # [ASSUMPTION] half days (1:00pm close) can't hold a 3:45pm exit, so they are skipped
+
+data:
+  stock_feed: sip                    # QQQ bars for backtests. Free Alpaca plans can query SIP history older than 15 minutes.
+  live_stock_feed: sip               # QQQ bars for the paper/live runner. Real-time SIP needs a paid plan; on the free plan use iex.
+  option_feed: indicative            # latest option trades for --dry-run marks (indicative = free, opra = paid)
+  adjustment: raw                    # unadjusted prices, as printed on the tape
+  cache_dir: data_cache              # downloaded bars are cached here (complete past sessions only)
+  strike_grid_fallback: 1.0          # [ASSUMPTION] if Alpaca's contract list is empty for a past expiry, assume a $1 strike
+                                     # grid. The chosen contract must still have real Alpaca trade bars, or the day is
+                                     # flagged. Set to null to fail instead.
+
+runner:
+  log_dir: logs
+  state_dir: state
+  bar_settle_seconds: 3              # wait this long after each minute closes before reading the bar
+  bar_wait_max_seconds: 45           # if the just-closed bar still hasn't arrived, log a warning and use the last bar
+  late_check_tolerance_seconds: 120  # [ASSUMPTION] a check that is this late (runner started late) is replayed only. If it
+                                     # was the day's first signal, no trade is placed (first-signal-only rule).
+  order_fill_timeout_seconds: 60
+
+backtest:
+  output_dir: output
