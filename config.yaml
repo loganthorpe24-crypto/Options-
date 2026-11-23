@@ -75,6 +75,8 @@ data:
   strike_grid_fallback: 1.0          # [ASSUMPTION] if Alpaca's contract list is empty for a past expiry, assume a $1 strike
                                      # grid. The chosen contract must still have real Alpaca trade bars, or the day is
                                      # flagged. Set to null to fail instead.
+  max_bar_gap_minutes: 5             # [ASSUMPTION] if the newest QQQ bar at a check (or trailing-stop minute) ended more
+                                     # than this many minutes earlier, it's a data error. A stale price is never used.
 
 runner:
   log_dir: logs

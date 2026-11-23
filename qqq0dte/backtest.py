@@ -212,7 +212,7 @@ class Backtester:
         signal: CheckResult | None = None
         for t in check_times(day, rules, a):
             try:
-                res = evaluate_check(setup, bars, t, rules, a)
+                res = evaluate_check(setup, bars, t, rules, a, self.cfg.data.max_bar_gap_minutes)
             except DataUnavailable as exc:
                 return DayResult(day.date, "data_error", f"check {hhmm(t)}: {exc}", checks=checks, setup=setup)
             checks.append(res)
@@ -261,15 +261,16 @@ class Backtester:
             giveback_fraction=rules.trail_giveback_fraction,
         )
         step = pd.Timedelta(minutes=a.trail_check_interval_minutes)
+        gap = self.cfg.data.max_bar_gap_minutes
         exit_reason, t_exit = f"hard_exit_{rules.hard_exit_time}", hard_exit
         t = t_entry + step
         while t < hard_exit:
             mark = last_trade_price(opt, t) if stop.needs_option_price else None
-            if stop.update(t, underlying=price_at(bars, t), option_price=mark):
+            if stop.update(t, underlying=price_at(bars, t, gap), option_price=mark):
                 exit_reason, t_exit = "trailing_stop", t
                 break
             t += step
-        underlying_exit = price_at(bars, t_exit)
+        underlying_exit = price_at(bars, t_exit, gap)
         if exit_reason != "trailing_stop":
             mark = last_trade_price(opt, t_exit) if stop.needs_option_price else None
             stop.mark_exit(t_exit, underlying=underlying_exit, option_price=mark)

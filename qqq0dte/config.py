@@ -78,6 +78,7 @@ class DataSettings:
     adjustment: str = "raw"
     cache_dir: str = "data_cache"
     strike_grid_fallback: float | None = 1.0
+    max_bar_gap_minutes: int = 5
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ ASSUMPTION_NOTES: dict[str, str] = {
     "assumptions.commission_per_contract": "Backtest commission per contract per side.",
     "assumptions.early_close_policy": "Half days (1pm close) can't fit the 3:45 exit or the 2:00 window, so they are skipped.",
     "data.strike_grid_fallback": "If Alpaca lists no contracts for a past expiry, assume this strike spacing ($). The contract must still have real trade bars.",
+    "data.max_bar_gap_minutes": "If the newest QQQ bar at a check / trailing-stop minute is older than this, it's a data error (no stale prices).",
     "data.stock_feed": "Alpaca stock feed for backtest bars (sip = consolidated tape).",
     "data.live_stock_feed": "Alpaca stock feed for the runner (free plans: iex; IEX volume makes VWAP differ from SIP).",
     "runner.late_check_tolerance_seconds": "Checks the runner evaluates later than this are replay-only. If one was the first signal, no trade.",
@@ -221,6 +223,7 @@ def validate(cfg: Config) -> None:
         "assumptions.contracts": a.contracts,
         "assumptions.trail_check_interval_minutes": a.trail_check_interval_minutes,
         "assumptions.option_fill_max_staleness_minutes": a.option_fill_max_staleness_minutes,
+        "data.max_bar_gap_minutes": cfg.data.max_bar_gap_minutes,
     }
     for key, value in positives.items():
         if value <= 0:

@@ -7,12 +7,17 @@ Modes:
 
 One session per call to run_session(). Every 10-minute check is logged with all
 three conditions for both sides, and appended to logs/checks_YYYY-MM-DD.csv.
-State is persisted to state/YYYY-MM-DD.json, so a restart can never re-enter.
+State is persisted per mode to state/YYYY-MM-DD_<mode>.json, so a restart can
+never re-enter, and paper and live state are never mixed.
+
+Once a position is open, the runner keeps going no matter what: data/API errors
+skip that minute, and the 15:45 exit is retried until the market closes.
 """
 
 from __future__ import annotations
 
 import csv
+import dataclasses
 import datetime as dt
 import json
 import logging
@@ -27,14 +32,15 @@ from .alpaca import AlpacaError, AlpacaSubscriptionError
 from .config import Config
 from .data import DataUnavailable, MarketDataProvider, TradingDay, bars_from_alpaca, regular_session
 from .exits import TrailingStop
-from .indicators import price_at
+from .indicators import opening_range, price_at
 from .options import occ_symbol, parse_occ, select_strike
-from .signals import CheckResult, atr_for_day, build_day_setup, check_times, evaluate_check
+from .signals import CheckResult, DaySetup, atr_for_day, build_day_setup, check_times, evaluate_check
 from .timeutil import ET, ONE_MINUTE, et_timestamp, hhmm, now_et
 
 log = logging.getLogger(__name__)
 
 TERMINAL_ORDER_STATES = {"filled", "canceled", "expired", "rejected", "done_for_day", "replaced"}
+EXIT_RETRY_SECONDS = 5.0
 
 
 class SystemClock:
@@ -56,32 +62,45 @@ class SystemClock:
 @dataclass
 class SessionState:
     date: str
+    mode: str = ""
     first_signal: dict | None = None
     entry: dict | None = None
     trail: dict | None = None
+    pending_exit: dict | None = None
+    exit_orders: list[str] = field(default_factory=list)
     exit: dict | None = None
     notes: list[str] = field(default_factory=list)
 
 
 class StateStore:
-    def __init__(self, directory: str | Path) -> None:
+    """One JSON file per (date, mode): paper, live and dry-run state never mix."""
+
+    def __init__(self, directory: str | Path, mode_tag: str) -> None:
         self.dir = Path(directory)
+        self.mode_tag = mode_tag
 
-    def path(self, date: dt.date) -> Path:
-        return self.dir / f"{date.isoformat()}.json"
+    def path(self, date: dt.date, mode_tag: str | None = None) -> Path:
+        return self.dir / f"{date.isoformat()}_{mode_tag or self.mode_tag}.json"
 
-    def load(self, date: dt.date) -> SessionState:
-        p = self.path(date)
+    def load(self, date: dt.date, mode_tag: str | None = None) -> SessionState:
+        p = self.path(date, mode_tag)
         if not p.exists():
-            return SessionState(date=date.isoformat())
-        return SessionState(**json.loads(p.read_text()))
+            return SessionState(date=date.isoformat(), mode=mode_tag or self.mode_tag)
+        raw = json.loads(p.read_text())
+        known = {f.name for f in dataclasses.fields(SessionState)}
+        return SessionState(**{k: v for k, v in raw.items() if k in known})
 
     def save(self, state: SessionState) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
+        state.mode = self.mode_tag
         p = self.path(dt.date.fromisoformat(state.date))
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(asdict(state), indent=2, default=str))
         tmp.replace(p)
+
+
+def open_position(state: SessionState) -> bool:
+    return bool(state.entry and state.entry.get("status") == "filled" and not state.exit)
 
 
 class Runner:
@@ -107,8 +126,10 @@ class Runner:
         self.live = live
         self.dry_run = dry_run
         self.clock = clock or SystemClock()
-        self.store = StateStore(cfg.runner.state_dir)
+        self.mode_tag = "dryrun" if dry_run else ("live" if live else "paper")
+        self.store = StateStore(cfg.runner.state_dir, self.mode_tag)
         self.log_dir = Path(cfg.runner.log_dir)
+        self.gap = cfg.data.max_bar_gap_minutes
 
     # ------------------------------------------------------------- helpers
     @property
@@ -158,6 +179,21 @@ class Runner:
                 "opening range differ from the SIP data used in backtests."
             ) from exc
 
+    def _warn_other_modes(self, today: dt.date) -> None:
+        for tag in ("live", "paper", "dryrun"):
+            if tag == self.mode_tag:
+                continue
+            other = self.store.load(today, tag)
+            if open_position(other):
+                lvl = logging.CRITICAL if tag == "live" else logging.WARNING
+                log.log(
+                    lvl,
+                    "A %s position from today is still OPEN (%s x %s) and is NOT managed by this %s run. "
+                    "Restart with %s to manage it.",
+                    tag.upper(), other.entry.get("qty"), other.entry.get("symbol"), self.mode_tag,
+                    {"live": "--live", "paper": "no flag", "dryrun": "--dry-run"}[tag],
+                )
+
     # ---------------------------------------------------------- market data
     def _today_bars(self, day: TradingDay, t: pd.Timestamp, *, wait: bool = True) -> pd.DataFrame:
         """Today's completed regular-session bars up to time t (waits briefly for the bar ending at t)."""
@@ -175,7 +211,7 @@ class Runner:
                 if bars.empty:
                     raise DataUnavailable(f"Alpaca returned no {self.cfg.strategy.underlying} bars up to {hhmm(t)}")
                 log.warning(
-                    "Bar ending %s not available after waiting; using last bar %s (no trades that minute or feed lag)",
+                    "Bar ending %s not available after waiting; last bar ends %s (no trades that minute or feed lag)",
                     hhmm(t), hhmm(bars.index[-1] + ONE_MINUTE),
                 )
                 return bars
@@ -208,22 +244,19 @@ class Runner:
         return strikes
 
     def _wait_fill(self, order: dict) -> dict:
+        """Poll until the order is terminal. Returns the final order (filled_qty may be < qty or 0)."""
         deadline = self.clock.now() + pd.Timedelta(seconds=self.cfg.runner.order_fill_timeout_seconds)
         current = order
         while str(current.get("status")) not in TERMINAL_ORDER_STATES and self.clock.now() < deadline:
             self.clock.sleep(1.0)
             current = self.client.get_order(order["id"])
-        status = str(current.get("status"))
-        if status != "filled":
-            filled = float(current.get("filled_qty") or 0)
-            if status not in TERMINAL_ORDER_STATES:
-                log.error("Order %s still %s after timeout; cancelling the remainder", order["id"], status)
-                self.client.cancel_order(order["id"])
-                current = self.client.get_order(order["id"])
-                filled = float(current.get("filled_qty") or 0)
-            if filled <= 0:
-                raise AlpacaError(f"Order {order['id']} not filled (status={current.get('status')}): {current}")
-            log.error("Order %s only partially filled: %s contracts", order["id"], filled)
+        if str(current.get("status")) not in TERMINAL_ORDER_STATES:
+            log.error("Order %s still %s after timeout; cancelling the remainder", order["id"], current.get("status"))
+            self.client.cancel_order(order["id"])
+            current = self.client.get_order(order["id"])
+        filled = float(current.get("filled_qty") or 0)
+        if str(current.get("status")) != "filled":
+            log.error("Order %s ended %s with %s filled", order["id"], current.get("status"), filled)
         return current
 
     # ------------------------------------------------------------- session
@@ -236,6 +269,7 @@ class Runner:
             log.info("%s is not a trading day. Nothing to do.", today)
             return None
         day, history = calendar[-1], calendar[:-1]
+        self._warn_other_modes(today)
         if day.is_early_close and a.early_close_policy == "skip":
             log.warning("%s closes early (%s). early_close_policy=skip, so no trading today.", today, day.close_time)
             return None
@@ -249,7 +283,7 @@ class Runner:
             return state
         if state.entry and state.entry.get("status") == "submitted":
             self._resolve_submitted_entry(state)
-        if state.first_signal and (not state.entry or state.entry.get("status") != "filled"):
+        if state.first_signal and not open_position(state):
             log.info("Today's first signal was already seen (%s); no (further) trade today.", state.first_signal)
             return state
 
@@ -275,7 +309,9 @@ class Runner:
                 replayed = self.clock.now() > t + late
                 if not replayed:
                     self.clock.sleep_until(t + settle)
-                res = evaluate_check(setup, self._today_bars(day, t, wait=not replayed), t, rules, a)
+                bars = self._today_bars(day, t, wait=not replayed)
+                setup = self._refresh_opening_range(setup, bars, rules)
+                res = evaluate_check(setup, bars, t, rules, a, self.gap)
                 log.info("%s%s", "[replay of missed check] " if replayed else "", res.log_line())
                 self._append_csv(f"checks_{today.isoformat()}.csv", {**res.as_row(), "replayed": replayed, "mode": self.mode})
                 if res.signal:
@@ -296,9 +332,21 @@ class Runner:
                 return state
             self._enter(day, setup.atr, signal, state)
 
-        if state.entry and state.entry.get("status") == "filled" and not state.exit:
+        if open_position(state):
             self._manage(day, state)
         return state
+
+    def _refresh_opening_range(self, setup: DaySetup, bars: pd.DataFrame, rules) -> DaySetup:
+        """The opening range is rebuilt from the (by now complete) 9:30-9:44 bars at every check, so a bar
+        that arrived late at 9:45 can't leave the range wrong for the rest of the day."""
+        hi, lo, n = opening_range(bars, setup.open_ts, rules.opening_range_minutes)
+        if (hi, lo, n) != (setup.or_high, setup.or_low, setup.or_bars):
+            log.warning(
+                "Opening range updated from late bars: [%.2f, %.2f] (%d bars) -> [%.2f, %.2f] (%d bars)",
+                setup.or_low, setup.or_high, setup.or_bars, lo, hi, n,
+            )
+            return dataclasses.replace(setup, or_high=hi, or_low=lo, or_bars=n)
+        return setup
 
     def run_forever(self) -> None:
         while True:
@@ -329,7 +377,7 @@ class Runner:
             "SIGNAL %s at %s (QQQ %.2f). BUY %d x %s (strike %g, %s) [%s]",
             side.upper(), hhmm(signal.check_time), signal.close, qty, symbol, strike, a.strike_selection, self.mode,
         )
-        client_order_id = f"qqq0dte-{day.date.isoformat()}-entry"
+        client_order_id = f"qqq0dte-{day.date.isoformat()}-{self.mode_tag}-entry"
         # Persist intent BEFORE sending, so a crash mid-submit can be resolved on restart (never re-sent).
         state.entry = {
             "status": "submitted", "side": side, "symbol": symbol, "strike": strike, "qty": qty,
@@ -389,6 +437,10 @@ class Runner:
         )
         if state.trail:
             stop.restore(state.trail)
+        if state.pending_exit:  # an exit was already decided before a restart: finish it, don't re-decide
+            p = state.pending_exit
+            self._exit(day, state, stop, p["reason"], pd.Timestamp(p["time"]).tz_convert(ET))
+            return
         hard_exit = et_timestamp(day.date, rules.hard_exit_time)
         step = pd.Timedelta(minutes=a.trail_check_interval_minutes)
         settle = pd.Timedelta(seconds=self.cfg.runner.bar_settle_seconds)
@@ -403,8 +455,14 @@ class Runner:
             self.clock.sleep_until(t + settle)
             if self.clock.now() >= hard_exit:
                 break
-            und = price_at(self._today_bars(day, t), t)
-            mark = self._option_last_price(e["symbol"]) if stop.needs_option_price else None
+            try:
+                und = price_at(self._today_bars(day, t), t, self.gap)
+                mark = self._option_last_price(e["symbol"]) if stop.needs_option_price else None
+            except (DataUnavailable, AlpacaError) as exc:
+                # Never abandon an open position over a data hiccup: skip this minute, keep managing.
+                log.error("Trailing-stop observation at %s skipped: %s", hhmm(t), exc)
+                t += step
+                continue
             was_armed = stop.armed
             fire = stop.update(t, underlying=und, option_price=mark)
             state.trail = stop.to_state()
@@ -418,58 +476,94 @@ class Runner:
         self.clock.sleep_until(hard_exit)
         self._exit(day, state, stop, f"hard_exit_{rules.hard_exit_time}", hard_exit)
 
+    # ---------------------------------------------------------------- exit
+    def _close_position(self, day: TradingDay, state: SessionState, symbol: str) -> list[dict]:
+        """Sell the whole position at market, retrying until it is flat or the market closes.
+
+        Before every (re)send it checks earlier exit orders and the live position, so it never
+        sells more than is held. Returns the exit orders that filled anything.
+        """
+        attempt = len(state.exit_orders)
+        while True:
+            try:
+                fills = []
+                for cid in state.exit_orders:
+                    o = self.client.get_order_by_client_order_id(cid)
+                    if o and str(o.get("status")) not in TERMINAL_ORDER_STATES:
+                        o = self._wait_fill(o)
+                    if o and float(o.get("filled_qty") or 0) > 0:
+                        fills.append(o)
+                pos = self.client.get_position(symbol)
+                held = int(abs(float(pos.get("qty", 0)))) if pos else 0
+                if held == 0:
+                    return fills
+                attempt += 1
+                cid = f"qqq0dte-{day.date.isoformat()}-{self.mode_tag}-exit-{attempt}"
+                state.exit_orders.append(cid)
+                self.store.save(state)
+                order = self.client.submit_order(
+                    symbol=symbol, qty=held, side="sell", order_type="market", time_in_force="day", client_order_id=cid,
+                )
+                self._wait_fill(order)
+            except AlpacaError as exc:
+                log.error("EXIT attempt %d for %s failed: %s", attempt, symbol, exc)
+                if self.clock.now() >= day.close_ts:
+                    log.critical("COULD NOT CLOSE %s BEFORE THE CLOSE. MANUAL ACTION REQUIRED.", symbol)
+                    raise
+                self.clock.sleep(EXIT_RETRY_SECONDS)
+
     def _exit(self, day: TradingDay, state: SessionState, stop: TrailingStop, reason: str, t: pd.Timestamp) -> None:
         e = state.entry
         symbol = e["symbol"]
-        try:
-            und = price_at(self._today_bars(day, t, wait=False), t)
-        except DataUnavailable:
-            und = math.nan
-        if reason != "trailing_stop" and not math.isnan(und):
-            stop.mark_exit(t, underlying=und, option_price=None if not stop.needs_option_price else self._option_last_price(symbol))
-        qty = int(e["qty"])
+        if not state.pending_exit:
+            state.pending_exit = {"reason": reason, "time": t.isoformat()}
+            state.trail = stop.to_state()
+            self.store.save(state)
+        log.info("EXIT decided (%s) at %s for %s [%s]", reason, hhmm(t), symbol, self.mode)
+        entry_px = float(e["fill_price"])
         if self.dry_run:
-            px, order_id = self._option_last_price(symbol), None
+            try:
+                px = self._option_last_price(symbol)
+            except (DataUnavailable, AlpacaError) as exc:
+                px = math.nan
+                log.error("DRY-RUN: could not mark exit price: %s", exc)
+            qty, order_ids = int(e["qty"]), []
             log.info("DRY-RUN: no order sent. Marked exit at latest trade %.2f", px)
         else:
-            pos = self.client.get_position(symbol)
-            if not pos:
-                log.error("EXIT %s: no open position in %s (closed manually?). Marking the trade closed.", reason, symbol)
-                state.exit = {"reason": reason, "time": t.isoformat(), "error": "position_missing"}
-                self.store.save(state)
-                return
-            qty = int(abs(float(pos.get("qty", qty))))
-            order = self.client.submit_order(
-                symbol=symbol, qty=qty, side="sell", order_type="market", time_in_force="day",
-                client_order_id=f"qqq0dte-{day.date.isoformat()}-exit-{t:%H%M}",
-            )
-            filled = self._wait_fill(order)
-            px, order_id = float(filled["filled_avg_price"]), filled["id"]
-            sold = int(float(filled.get("filled_qty") or qty))
-            if sold != qty:
-                log.error("EXIT only sold %d of %d contracts of %s; CHECK THE ACCOUNT", sold, qty, symbol)
-            qty = sold
-        entry_px = float(e["fill_price"])
-        pnl = (px - entry_px) * 100 * qty
+            fills = self._close_position(day, state, symbol)  # SELL FIRST; everything below is bookkeeping
+            qty = sum(int(float(o.get("filled_qty") or 0)) for o in fills)
+            notional = sum(float(o["filled_avg_price"]) * float(o["filled_qty"]) for o in fills if o.get("filled_avg_price"))
+            px = notional / qty if qty else math.nan
+            order_ids = [o.get("id") for o in fills]
+            if not fills:
+                log.error("EXIT %s: no open position in %s and no exit fills (closed manually?).", reason, symbol)
+            elif qty != int(e["qty"]):
+                log.error("EXIT sold %d contracts but entry was %s; CHECK THE ACCOUNT", qty, e["qty"])
+        try:
+            und = price_at(self._today_bars(day, t, wait=False), t, self.gap)
+            if reason != "trailing_stop":
+                stop.mark_exit(t, underlying=und, option_price=None if not stop.needs_option_price else px)
+        except (DataUnavailable, AlpacaError) as exc:
+            und = math.nan
+            log.warning("Could not read QQQ at the exit for logging: %s", exc)
+        pnl = (px - entry_px) * 100 * qty if qty and not math.isnan(px) else math.nan
         state.exit = {
             "reason": reason, "time": t.isoformat(), "sent_at": self.clock.now().isoformat(),
-            "fill_price": px, "order_id": order_id, "qty": qty,
-            "pnl": round(pnl, 2), "pnl_pct": round((px / entry_px - 1) * 100, 2) if entry_px else None,
-            "underlying": und, "trail": stop.to_state(),
+            "fill_price": None if math.isnan(px) else px, "order_ids": order_ids, "qty": qty,
+            "pnl": None if math.isnan(pnl) else round(pnl, 2),
+            "pnl_pct": None if math.isnan(px) or not entry_px else round((px / entry_px - 1) * 100, 2),
+            "underlying": None if math.isnan(und) else und, "trail": stop.to_state(),
             "trail_exit_value": stop.exit_value, "trail_retracement_from_peak": stop.retracement_from_peak,
         }
         state.trail = stop.to_state()
         self.store.save(state)
-        log.info(
-            "EXIT (%s) %d x %s @ %.2f; entry %.2f; P&L %+.2f. Trailing: %s",
-            reason, qty, symbol, px, entry_px, pnl, stop.describe(),
-        )
+        log.info("EXIT (%s) %d x %s @ %.2f; entry %.2f; P&L %+.2f. Trailing: %s", reason, qty, symbol, px, entry_px, pnl, stop.describe())
         self._append_csv(
             "trades.csv",
             {
                 "date": day.date.isoformat(), "mode": self.mode, "side": e["side"], "signal_time": hhmm(pd.Timestamp(e["signal_time"])),
                 "strike": e["strike"], "option_symbol": symbol, "contracts": qty, "entry_price": entry_px,
-                "exit_time": hhmm(t), "exit_price": px, "exit_reason": reason, "pnl": round(pnl, 2),
+                "exit_time": hhmm(t), "exit_price": px, "exit_reason": reason, "pnl": state.exit["pnl"],
                 "trail_basis": stop.basis, "trail_peak": stop.peak, "trail_peak_time": hhmm(stop.peak_time),
                 "trail_armed": stop.armed, "trail_armed_time": hhmm(stop.armed_time) if stop.armed_time is not None else "",
                 "trail_armed_value": stop.armed_value, "trail_exit_value": stop.exit_value,

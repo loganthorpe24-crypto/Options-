@@ -92,3 +92,16 @@ def test_adjusted_contracts_are_ignored_and_bars_parse_to_et(tmp_path):
     assert bars.index[0] == pd.Timestamp("2026-11-20 09:30", tz="America/New_York") and len(bars) == 390
     daily = p.daily_bars(dt.date(2026, 11, 1), D)
     assert pd.Timestamp(D) in daily.index
+
+
+def test_daily_cache_month_written_mid_month_is_refreshed_after_month_end(tmp_path):
+    scenario, _ = build_scenario(put_day_closes(), target_date=dt.date(2026, 11, 30))
+    rest = FakeRest(scenario)
+    kw = dict(underlying="QQQ", stock_feed="sip", cache_dir=tmp_path)
+    # On Mon Nov 30, the Nov file can only hold bars through Nov 27
+    AlpacaDataProvider(rest, today=dt.date(2026, 11, 30), **kw).daily_bars(dt.date(2026, 11, 1), dt.date(2026, 11, 27))
+    assert not (tmp_path / "stocks/QQQ/1Day/sip_raw/2026-11.csv").exists()
+    # On Dec 1 the ATR needs Nov 30: the partial file must not be trusted
+    d = AlpacaDataProvider(rest, today=dt.date(2026, 12, 1), **kw).daily_bars(dt.date(2026, 11, 1), dt.date(2026, 11, 30))
+    assert pd.Timestamp("2026-11-30") in d.index
+    assert (tmp_path / "stocks/QQQ/1Day/sip_raw/2026-11.csv").exists()

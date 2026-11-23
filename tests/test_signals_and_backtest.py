@@ -177,3 +177,13 @@ def test_max_drawdown():
     s = summarize(BacktestResult(D, D, days))
     assert s["max_drawdown"] == -350.0  # peak 100 -> trough -250
     assert s["total_pnl"] == 150.0 and s["wins"] == 3 and s["losses"] == 2
+
+
+def test_stale_underlying_bars_are_a_data_error_not_a_silent_price():
+    c = put_day_closes()
+    provider, _ = build_scenario(c)
+    bars = provider.minute[D]
+    gap = (bars.index >= et_timestamp(D, "10:05")) & (bars.index < et_timestamp(D, "12:00"))
+    provider.minute[D] = bars.loc[~gap]
+    day = run(provider)
+    assert day.status == "data_error" and "max_bar_gap_minutes" in day.reason and day.trade is None

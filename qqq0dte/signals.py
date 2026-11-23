@@ -19,6 +19,7 @@ import pandas as pd
 from .config import Assumptions, StrategyRules
 from .data import DataUnavailable, TradingDay
 from .indicators import (
+    check_bar_gap,
     completed_bars,
     compute_atr,
     daily_ohlc_from_minutes,
@@ -240,12 +241,14 @@ def evaluate_check(
     t: pd.Timestamp,
     rules: StrategyRules,
     assumptions: Assumptions,
+    max_gap_minutes: int | None = None,
 ) -> CheckResult:
     """Evaluate both sides' three conditions using only bars completed by time t."""
     done = completed_bars(today_bars, t)
     done = done.loc[done.index >= setup.open_ts]
     if done.empty:
         raise DataUnavailable(f"no completed bars at the {hhmm(t)} check")
+    check_bar_gap(done.index[-1], t, max_gap_minutes)
     close = float(done["close"].iloc[-1])
     vwap = vwap_at(done, t, assumptions.vwap_price, session_open=setup.open_ts)
     k = minute_offset(setup.open_ts, t)

@@ -49,6 +49,7 @@ every start (`python -m qqq0dte assumptions` prints them) and saved with each ba
 | `option_fill_max_staleness_minutes` | `5` | no option trade within 5 min → the trade is a **data error**, never a made-up price |
 | `slippage_per_share`, `commission_per_contract` | `0` | backtest costs |
 | `early_close_policy` | `skip` | half days (1pm close) can't hold a 3:45 exit, so they are skipped |
+| `data.max_bar_gap_minutes` | `5` | if the newest QQQ bar at a check or trailing-stop minute is older than this, it's a data error (no stale prices) |
 | `data.strike_grid_fallback` | `1.0` | if Alpaca lists no contracts for a past expiry, assume a $1 grid (the contract must still have real trade bars) |
 | `runner.late_check_tolerance_seconds` | `120` | if the runner starts late and a missed check was the first signal, no trade |
 
@@ -179,9 +180,16 @@ Start it before 9:45 ET. What it does:
 - Every check is logged with all three conditions for both sides: console, `logs/run_<date>.log`,
   `logs/checks_<date>.csv`.
 - Fills and P&L go to `logs/trades.csv`.
-- State is saved in `state/<date>.json`. A restart never re-enters: an order caught mid-submit is looked
-  up by its client order id, and a first signal missed while the runner was down means no trade that
-  day.
+- State is saved per mode in `state/<date>_<paper|live|dryrun>.json`, so paper and live never mix (a
+  paper run warns loudly if a live position from today is still open).
+- A restart never re-enters: an entry order caught mid-submit is looked up by its client order id, and
+  a first signal missed while the runner was down means no trade that day.
+- After a restart mid-trade, the minutes missed while it was down are replayed from QQQ bars for the
+  trailing stop.
+- Once a position is open the runner does not give up. A data/API error skips that minute's
+  trailing-stop check, and the exit sell is retried until the position is flat or the market closes.
+  Before each retry it checks earlier exit orders and the live position, so it never sells more than
+  is held.
 
 Scheduling with cron (server clock in ET):
 

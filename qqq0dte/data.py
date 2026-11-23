@@ -235,9 +235,7 @@ class AlpacaDataProvider(MarketDataProvider):
 
     # ---------------------------------------------------------- stock bars
     def minute_bars(self, day: TradingDay) -> pd.DataFrame:
-        path = (
-            self.cache_dir / "stocks" / self.underlying / "1Min" / self.stock_feed / f"{day.date.isoformat()}.csv"
-        )
+        path = self._stock_dir("1Min") / f"{day.date.isoformat()}.csv"
         if path.exists():
             return _read_bars(path)
         self._require_online(f"1-minute {self.underlying} bars for {day.date}", path)
@@ -254,19 +252,29 @@ class AlpacaDataProvider(MarketDataProvider):
             _write_bars(bars, path)
         return bars
 
+    def _stock_dir(self, timeframe: str) -> Path:
+        # feed and adjustment are part of the path so differently-sourced bars are never mixed
+        return self.cache_dir / "stocks" / self.underlying / timeframe / f"{self.stock_feed}_{self.adjustment}"
+
     def daily_bars(self, start: dt.date, end: dt.date) -> pd.DataFrame:
+        """Daily bars by calendar month. `YYYY-MM.csv` is written only once the month is over (complete);
+        a month still in progress is saved as `YYYY-MM.partial.csv`, which is read only in --offline mode.
+        atr_for_day() verifies every date it needs is present either way."""
         frames = []
         year, month = start.year, start.month
+        today = self._today()
         while (year, month) <= (end.year, end.month):
             month_start = dt.date(year, month, 1)
             month_end = dt.date(year, month, _calendar.monthrange(year, month)[1])
-            path = self.cache_dir / "stocks" / self.underlying / "1Day" / self.stock_feed / f"{year:04d}-{month:02d}.csv"
-            # Complete months are read from cache. The current month is re-downloaded when online and read
-            # from cache only when offline; atr_for_day() still verifies every needed date is present.
-            if path.exists() and (month_end < self._today() or self.offline):
-                frames.append(_read_daily(path))
+            complete_path = self._stock_dir("1Day") / f"{year:04d}-{month:02d}.csv"
+            partial_path = self._stock_dir("1Day") / f"{year:04d}-{month:02d}.partial.csv"
+            month_over = month_end < today
+            if complete_path.exists():
+                frames.append(_read_daily(complete_path))
+            elif self.offline and partial_path.exists():
+                frames.append(_read_daily(partial_path))
             else:
-                self._require_online(f"daily {self.underlying} bars for {year}-{month:02d}", path)
+                self._require_online(f"daily {self.underlying} bars for {year}-{month:02d}", complete_path)
                 raw = self.client.stock_bars(
                     self.underlying,
                     "1Day",
@@ -276,10 +284,13 @@ class AlpacaDataProvider(MarketDataProvider):
                     adjustment=self.adjustment,
                 )
                 df = daily_from_alpaca(raw)
-                today_ts = pd.Timestamp(self._today())
-                complete = df.loc[df.index < today_ts]  # never cache today's partial daily bar
-                if not complete.empty:
-                    _write_daily(complete, path)
+                finished = df.loc[df.index < pd.Timestamp(today)]  # never cache today's partial daily bar
+                if not finished.empty:
+                    if month_over:
+                        _write_daily(finished, complete_path)
+                        partial_path.unlink(missing_ok=True)
+                    else:
+                        _write_daily(finished, partial_path)
                 frames.append(df)
             year, month = (year + 1, 1) if month == 12 else (year, month + 1)
         frames = [f for f in frames if not f.empty]

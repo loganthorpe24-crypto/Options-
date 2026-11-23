@@ -27,11 +27,24 @@ def completed_bars(bars: pd.DataFrame, t: pd.Timestamp) -> pd.DataFrame:
     return bars.loc[bars.index <= t - ONE_MINUTE]
 
 
-def price_at(bars: pd.DataFrame, t: pd.Timestamp) -> float:
+def check_bar_gap(last_bar_start: pd.Timestamp, t: pd.Timestamp, max_gap_minutes: int | None) -> None:
+    """Fail loudly if the newest bar before t is older than max_gap_minutes (missing data, not a quiet tape)."""
+    if max_gap_minutes is None:
+        return
+    age = (t - (last_bar_start + ONE_MINUTE)) / ONE_MINUTE
+    if age > max_gap_minutes:
+        raise DataUnavailable(
+            f"newest 1-minute bar before {hhmm(t)} ended at {hhmm(last_bar_start + ONE_MINUTE)} "
+            f"({age:.0f} min old > data.max_bar_gap_minutes={max_gap_minutes}); refusing to use a stale price"
+        )
+
+
+def price_at(bars: pd.DataFrame, t: pd.Timestamp, max_gap_minutes: int | None = None) -> float:
     """Last traded price at time t = close of the last bar that ended at or before t."""
     done = completed_bars(bars, t)
     if done.empty:
         raise DataUnavailable(f"no completed 1-minute bar at or before {hhmm(t)}")
+    check_bar_gap(done.index[-1], t, max_gap_minutes)
     return float(done["close"].iloc[-1])
 
 

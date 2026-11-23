@@ -101,7 +101,8 @@ def cmd_run(args, cfg) -> int:
     log.info(DISCLAIMER)
     log_assumptions(cfg, log)
     # The ONLY place a live client can be created: the explicit --live flag.
-    client = AlpacaClient.from_env(live=args.live, live_confirmed=args.live)
+    # Short timeouts/retries: the exit loop retries on its own, and a 3:45 sell must not wait minutes on one call.
+    client = AlpacaClient.from_env(live=args.live, live_confirmed=args.live, timeout=10, max_retries=2)
     provider = _provider(cfg, offline=False, feed=cfg.data.live_stock_feed, client=client)
     runner = Runner(cfg, client, provider, live=args.live, dry_run=args.dry_run)
     runner.preflight()

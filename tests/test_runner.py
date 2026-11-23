@@ -92,6 +92,19 @@ class FakeAlpaca:
         q = self.position_qty.get(symbol, 0)
         return {"qty": str(q)} if q else None
 
+    def fail_stock_bars_between(self, start, end):
+        """Simulate an Alpaca outage for QQQ bars between two clock times."""
+        real = self.stock_bars
+
+        def flaky(*args, **kw):
+            if start <= self.clock.now() < end:
+                from qqq0dte.alpaca import AlpacaError
+
+                raise AlpacaError("simulated HTTP 503")
+            return real(*args, **kw)
+
+        self.stock_bars = flaky
+
 
 def make(tmp_path, closes=None, start="09:20", dry_run=False):
     provider, _ = build_scenario(put_day_closes() if closes is None else closes)
@@ -108,7 +121,7 @@ def test_paper_session_buys_at_signal_and_sells_at_1545(tmp_path):
     state = runner.run_session()
     assert [o["side"] for o in client.order_log] == ["buy", "sell"]
     buy, sell = client.order_log
-    assert buy["symbol"] == "QQQ261120P00099000" and buy["client_order_id"] == "qqq0dte-2026-11-20-entry"
+    assert buy["symbol"] == "QQQ261120P00099000" and buy["client_order_id"] == "qqq0dte-2026-11-20-paper-entry"
     assert buy["at"].strftime("%H:%M") == "10:30"
     assert sell["at"].strftime("%H:%M") == "15:45"
     assert state.exit["reason"] == "hard_exit_15:45"
@@ -160,7 +173,7 @@ def test_runner_refuses_live_mismatch(tmp_path):
 
 
 def test_state_store_roundtrip(tmp_path):
-    store = StateStore(tmp_path)
+    store = StateStore(tmp_path, "paper")
     s = store.load(D)
     s.first_signal = {"side": "put"}
     store.save(s)
@@ -172,13 +185,13 @@ def test_restart_mid_submit_resolves_existing_order_and_manages_it(tmp_path):
     clock.t = et_timestamp(D, "10:30:03")
     sym = "QQQ261120P00099000"
     order = client.submit_order(symbol=sym, qty=10, side="buy", order_type="market", time_in_force="day",
-                                client_order_id="qqq0dte-2026-11-20-entry")
-    store = StateStore(cfg.runner.state_dir)
+                                client_order_id="qqq0dte-2026-11-20-paper-entry")
+    store = StateStore(cfg.runner.state_dir, "paper")
     st = store.load(D)
     st.first_signal = {"side": "put", "time": et_timestamp(D, "10:30").isoformat()}
     st.entry = {"status": "submitted", "side": "put", "symbol": sym, "strike": 99.0, "qty": 10,
                 "signal_time": et_timestamp(D, "10:30").isoformat(), "entry_underlying": 99.0, "atr": 1.0,
-                "fill_price": None, "order_id": None, "client_order_id": "qqq0dte-2026-11-20-entry", "simulated": False}
+                "fill_price": None, "order_id": None, "client_order_id": "qqq0dte-2026-11-20-paper-entry", "simulated": False}
     store.save(st)
     clock.t = et_timestamp(D, "11:00")
     state = Runner(cfg, client, runner.provider, clock=clock).run_session()
@@ -189,10 +202,10 @@ def test_restart_mid_submit_resolves_existing_order_and_manages_it(tmp_path):
 
 def test_restart_mid_submit_order_never_arrived_means_no_trade(tmp_path):
     runner, client, clock, cfg = make(tmp_path)
-    store = StateStore(cfg.runner.state_dir)
+    store = StateStore(cfg.runner.state_dir, "paper")
     st = store.load(D)
     st.first_signal = {"side": "put"}
-    st.entry = {"status": "submitted", "symbol": "QQQ261120P00099000", "client_order_id": "qqq0dte-2026-11-20-entry", "simulated": False}
+    st.entry = {"status": "submitted", "symbol": "QQQ261120P00099000", "client_order_id": "qqq0dte-2026-11-20-paper-entry", "simulated": False}
     store.save(st)
     clock.t = et_timestamp(D, "11:00")
     state = Runner(cfg, client, runner.provider, clock=clock).run_session()
@@ -205,13 +218,13 @@ def test_restart_mid_trade_replays_missed_minutes_for_trailing_stop(tmp_path):
     runner, client, clock, cfg = make(tmp_path, closes=trailing_put_day_closes())
     sym = "QQQ261120P00099000"
     clock.t = et_timestamp(D, "10:30:03")
-    client.submit_order(symbol=sym, qty=10, side="buy", order_type="market", time_in_force="day", client_order_id="qqq0dte-2026-11-20-entry")
-    store = StateStore(cfg.runner.state_dir)
+    client.submit_order(symbol=sym, qty=10, side="buy", order_type="market", time_in_force="day", client_order_id="qqq0dte-2026-11-20-paper-entry")
+    store = StateStore(cfg.runner.state_dir, "paper")
     st = store.load(D)
     st.first_signal = {"side": "put"}
     st.entry = {"status": "filled", "side": "put", "symbol": sym, "strike": 99.0, "qty": 10,
                 "signal_time": et_timestamp(D, "10:30").isoformat(), "entry_underlying": 99.0, "atr": 1.0,
-                "fill_price": 0.5, "order_id": "o1", "client_order_id": "qqq0dte-2026-11-20-entry", "simulated": False}
+                "fill_price": 0.5, "order_id": "o1", "client_order_id": "qqq0dte-2026-11-20-paper-entry", "simulated": False}
     store.save(st)
     # runner was down from 10:30 to 13:30; the 50% giveback happened at 12:50 (see backtest test)
     clock.t = et_timestamp(D, "13:30")
@@ -220,3 +233,44 @@ def test_restart_mid_trade_replays_missed_minutes_for_trailing_stop(tmp_path):
     assert pd.Timestamp(state.exit["time"]).strftime("%H:%M") == "12:50"
     assert state.exit["trail"]["armed"] is True and state.exit["trail"]["peak"] == pytest.approx(5.0)
     assert client.order_log[-1]["side"] == "sell" and client.order_log[-1]["at"].strftime("%H:%M") == "13:30"
+
+
+def test_api_outage_mid_trade_still_exits_at_1545(tmp_path):
+    runner, client, clock, cfg = make(tmp_path)
+    client.fail_stock_bars_between(et_timestamp(D, "12:00"), et_timestamp(D, "16:00"))
+    state = runner.run_session()
+    assert [o["side"] for o in client.order_log] == ["buy", "sell"]
+    assert client.order_log[-1]["at"].strftime("%H:%M") == "15:45"
+    assert state.exit["reason"] == "hard_exit_15:45" and client.position_qty["QQQ261120P00099000"] == 0
+
+
+def test_exit_order_errors_are_retried_without_double_selling(tmp_path):
+    from qqq0dte.alpaca import AlpacaError
+
+    runner, client, clock, cfg = make(tmp_path)
+    real_submit, calls = client.submit_order, {"n": 0}
+
+    def flaky_submit(**kw):
+        if kw["side"] == "sell":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise AlpacaError("simulated timeout on the sell POST")
+        return real_submit(**kw)
+
+    client.submit_order = flaky_submit
+    state = runner.run_session()
+    sells = [o for o in client.order_log if o["side"] == "sell"]
+    assert len(sells) == 1 and client.position_qty["QQQ261120P00099000"] == 0
+    assert state.exit["qty"] == 10 and len(state.exit_orders) == 2
+
+
+def test_paper_and_live_state_are_separate(tmp_path):
+    runner, client, clock, cfg = make(tmp_path)
+    live_store = StateStore(cfg.runner.state_dir, "live")
+    st = live_store.load(D)
+    st.first_signal = {"side": "put"}
+    st.entry = {"status": "filled", "symbol": "QQQ261120P00099000", "qty": 10}
+    live_store.save(st)
+    state = runner.run_session()  # paper run is unaffected by the live file and trades normally
+    assert state.mode == "paper" and state.exit is not None
+    assert live_store.load(D).exit is None  # the live record is untouched
