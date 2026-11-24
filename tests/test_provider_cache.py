@@ -105,3 +105,17 @@ def test_daily_cache_month_written_mid_month_is_refreshed_after_month_end(tmp_pa
     d = AlpacaDataProvider(rest, today=dt.date(2026, 12, 1), **kw).daily_bars(dt.date(2026, 11, 1), dt.date(2026, 11, 30))
     assert pd.Timestamp("2026-11-30") in d.index
     assert (tmp_path / "stocks/QQQ/1Day/sip_raw/2026-11.csv").exists()
+
+
+def test_nyse_calendar_and_grid_strike_sources_need_no_trading_api(tmp_path):
+    import pytest
+
+    pytest.importorskip("pandas_market_calendars")
+    p = AlpacaDataProvider(None, underlying="QQQ", stock_feed="sip", cache_dir=tmp_path, offline=True,
+                           calendar_source="pandas_market_calendars", strike_source="grid")
+    days = {d.date: d for d in p.trading_days(dt.date(2025, 1, 6), dt.date(2025, 12, 31))}
+    assert dt.date(2025, 1, 9) not in days  # one-off closure
+    assert days[dt.date(2025, 11, 28)].close_time == dt.time(13, 0) and days[dt.date(2025, 11, 28)].is_early_close
+    assert days[dt.date(2025, 11, 26)].close_time == dt.time(16, 0)
+    strikes, src = p.option_strikes(D, "put", 631.4)
+    assert src == "grid_1" and 631.0 in strikes and 632.0 in strikes

@@ -116,6 +116,13 @@ different keys.
 If any of these is unavailable, the code raises with the exact endpoint, symbol and date. It never
 substitutes prices.
 
+**Backtesting without the trading API.** The calendar and the strike list are the only things the
+backtest takes from the trading API (`paper-api.alpaca.markets`). If you can only reach market data,
+set `data.calendar_source: pandas_market_calendars` (NYSE calendar incl. half days; `pip install
+pandas_market_calendars`) and `data.strike_source: grid` ($1 strikes; every chosen contract must
+still have real Alpaca trade bars). Set `APCA_AUTH_MODE=proxy` only if an outbound proxy you control
+adds the Alpaca credentials to each request. The process then holds no keys.
+
 ## Run the backtest
 
 ```bash
@@ -156,11 +163,11 @@ The command runs the normal backtest for that day with your config and prints:
 Exit codes: `0` = put signal at 10:30, `1` = different/no signal, `3` = signal but option data missing,
 `2` = configuration/credential/data error. **Nothing is tuned to force a match.**
 
-What to watch for: with about 5.5 hours left, an at-the-money 0DTE QQQ put normally costs a few dollars.
-A $632 put at $11.26 therefore suggests QQQ was well below $632 at 10:30, i.e. the put was in the money.
-If so, `strike_selection: atm` will pick a lower strike than $632, and the P&L will differ from the
-video even when the signal matches. The validation output shows QQQ's actual price and the 632P's
-intrinsic value, so you can see this directly. (The creator never states his strike rule.)
+Result on Alpaca data (SIP feed, default assumptions): the rules fire a **PUT at 11:10, not 10:30**.
+At 10:30 QQQ was $632.23 (so $632 was the at-the-money strike), but the close was still $4.07 above
+`OR low − 0.3×ATR` (the 5-day ATR was an unusually large $19.02), and $0.16 above the lower noise band.
+Alpaca's tape shows the creator's $632 put trading around $4.48 at 10:30 and $22.44 at 15:45, not
+$11.26 and $25.76. The backtest's own trade that day was 10× $628 puts, $4.35 → $18.25, +$13,900.
 
 ## Paper trading
 

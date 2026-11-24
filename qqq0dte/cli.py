@@ -56,6 +56,8 @@ def _provider(cfg, *, offline: bool, feed: str | None = None, client=None) -> Al
         cache_dir=cfg.data.cache_dir,
         strike_grid_fallback=cfg.data.strike_grid_fallback,
         offline=offline,
+        calendar_source=cfg.data.calendar_source,
+        strike_source=cfg.data.strike_source,
     )
 
 

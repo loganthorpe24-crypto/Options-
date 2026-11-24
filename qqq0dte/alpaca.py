@@ -26,6 +26,9 @@ LIVE_TRADING_BASE_URL = "https://api.alpaca.markets"
 
 KEY_ENV = "APCA_API_KEY_ID"
 SECRET_ENV = "APCA_API_SECRET_KEY"
+# Optional: APCA_AUTH_MODE=proxy means an outbound proxy you control adds the Alpaca credentials to every
+# request (e.g. a cloud sandbox with saved network secrets). The process then holds no keys and sends none.
+AUTH_MODE_ENV = "APCA_AUTH_MODE"
 
 
 class AlpacaError(RuntimeError):
@@ -76,8 +79,8 @@ def _message(resp: requests.Response) -> str:
 class AlpacaClient:
     def __init__(
         self,
-        key_id: str,
-        secret_key: str,
+        key_id: str | None,
+        secret_key: str | None,
         *,
         live: bool = False,
         live_confirmed: bool = False,
@@ -93,17 +96,26 @@ class AlpacaClient:
         self.live = bool(live)
         self.trading_base_url = LIVE_TRADING_BASE_URL if self.live else PAPER_TRADING_BASE_URL
         self.data_base_url = DATA_BASE_URL
-        self._headers = {
-            "APCA-API-KEY-ID": key_id,
-            "APCA-API-SECRET-KEY": secret_key,
-            "Accept": "application/json",
-        }
+        self._headers = {"Accept": "application/json"}
+        if key_id is None and secret_key is None:
+            self.auth = "proxy"  # credentials are injected by an outbound proxy
+        elif key_id and secret_key:
+            self.auth = "headers"
+            self._headers.update({"APCA-API-KEY-ID": key_id, "APCA-API-SECRET-KEY": secret_key})
+        else:
+            raise MissingCredentialsError("Both the Alpaca key ID and the secret key are required")
         self.session = session or requests.Session()
         self.max_retries = max_retries
         self.timeout = timeout
 
     @classmethod
     def from_env(cls, *, live: bool = False, live_confirmed: bool = False, **kwargs: Any) -> "AlpacaClient":
+        mode = os.environ.get(AUTH_MODE_ENV, "headers").strip().lower()
+        if mode == "proxy":
+            log.info("%s=proxy: Alpaca credentials are added by the outbound proxy; none are held here.", AUTH_MODE_ENV)
+            return cls(None, None, live=live, live_confirmed=live_confirmed, **kwargs)
+        if mode != "headers":
+            raise MissingCredentialsError(f"{AUTH_MODE_ENV} must be 'headers' (default) or 'proxy', got {mode!r}")
         key, secret = load_credentials()
         return cls(key, secret, live=live, live_confirmed=live_confirmed, **kwargs)
 

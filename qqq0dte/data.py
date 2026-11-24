@@ -134,6 +134,31 @@ def _read_daily(path: Path) -> pd.DataFrame:
     return df[DAILY_COLUMNS].astype(float)
 
 
+def _not_recent(end: pd.Timestamp) -> pd.Timestamp:
+    """Historical requests never reach into the last 16 minutes: free Alpaca plans may not query recent SIP data."""
+    return min(end, now_et().floor("min") - pd.Timedelta(minutes=16))
+
+
+def nyse_calendar_year(year: int) -> list[TradingDay]:
+    """NYSE sessions (incl. 1pm half days and one-off closures) from the pandas_market_calendars package."""
+    try:
+        import pandas_market_calendars as mcal
+    except ImportError as exc:
+        raise DataUnavailable(
+            "data.calendar_source=pandas_market_calendars but the package is not installed: "
+            "pip install pandas_market_calendars"
+        ) from exc
+    sched = mcal.get_calendar("NYSE").schedule(start_date=f"{year}-01-01", end_date=f"{year}-12-31")
+    if sched.empty:
+        raise DataUnavailable(f"pandas_market_calendars returned no NYSE sessions for {year}")
+    opens = sched["market_open"].dt.tz_convert(ET)
+    closes = sched["market_close"].dt.tz_convert(ET)
+    return [
+        TradingDay(ix.date(), o.time().replace(second=0, microsecond=0), c.time().replace(second=0, microsecond=0))
+        for ix, o, c in zip(sched.index, opens, closes)
+    ]
+
+
 def strike_grid(near_price: float, increment: float, width: int = 60) -> list[float]:
     base = round(near_price / increment) * increment
     return [round(base + i * increment, 4) for i in range(-width, width + 1)]
@@ -177,6 +202,8 @@ class AlpacaDataProvider(MarketDataProvider):
         strike_grid_fallback: float | None = 1.0,
         offline: bool = False,
         today: dt.date | None = None,
+        calendar_source: str = "alpaca",
+        strike_source: str = "alpaca_contracts",
     ) -> None:
         if client is None and not offline:
             raise ValueError("AlpacaDataProvider needs an AlpacaClient unless offline=True")
@@ -189,6 +216,8 @@ class AlpacaDataProvider(MarketDataProvider):
         self.offline = offline
         self._fixed_today = today
         self._calendar_mem: dict[int, list[TradingDay]] = {}
+        self.calendar_source = calendar_source
+        self.strike_source = strike_source
 
     # ---------------------------------------------------------------- utils
     def _today(self) -> dt.date:
@@ -204,6 +233,9 @@ class AlpacaDataProvider(MarketDataProvider):
     # ------------------------------------------------------------- calendar
     def _calendar_year(self, year: int) -> list[TradingDay]:
         if year in self._calendar_mem:
+            return self._calendar_mem[year]
+        if self.calendar_source == "pandas_market_calendars":
+            self._calendar_mem[year] = nyse_calendar_year(year)
             return self._calendar_mem[year]
         path = self.cache_dir / "calendar" / f"{year}.json"
         # Past years never change. The current/future year's calendar is refreshed once a day when online.
@@ -240,7 +272,7 @@ class AlpacaDataProvider(MarketDataProvider):
             return _read_bars(path)
         self._require_online(f"1-minute {self.underlying} bars for {day.date}", path)
         raw = self.client.stock_bars(
-            self.underlying, "1Min", day.open_ts, day.close_ts, feed=self.stock_feed, adjustment=self.adjustment
+            self.underlying, "1Min", day.open_ts, _not_recent(day.close_ts), feed=self.stock_feed, adjustment=self.adjustment
         )
         bars = regular_session(bars_from_alpaca(raw), day)
         if bars.empty:
@@ -279,7 +311,7 @@ class AlpacaDataProvider(MarketDataProvider):
                     self.underlying,
                     "1Day",
                     et_timestamp(month_start, "00:00"),
-                    et_timestamp(month_end, "23:59"),
+                    _not_recent(et_timestamp(month_end, "23:59")),
                     feed=self.stock_feed,
                     adjustment=self.adjustment,
                 )
@@ -304,6 +336,9 @@ class AlpacaDataProvider(MarketDataProvider):
     def option_strikes(self, expiry: dt.date, right: str, near_price: float) -> tuple[list[float], str]:
         if right not in ("call", "put"):
             raise ValueError(f"right must be call/put, got {right!r}")
+        if self.strike_source == "grid":
+            inc = self.strike_grid_fallback
+            return strike_grid(near_price, inc), f"grid_{inc:g}"
         path = self.cache_dir / "options" / "contracts" / self.underlying / f"{expiry.isoformat()}_{right}.json"
         strikes: list[float] = []
         if path.exists():

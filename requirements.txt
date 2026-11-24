@@ -4,3 +4,5 @@ numpy>=1.24
 PyYAML>=6.0
 tzdata>=2023.3
 pytest>=7.0
+# optional: only for data.calendar_source: pandas_market_calendars
+# pandas_market_calendars>=4.4

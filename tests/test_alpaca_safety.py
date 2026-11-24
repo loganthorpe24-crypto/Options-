@@ -110,3 +110,17 @@ def test_offline_provider_never_invents_data(tmp_path):
     provider = AlpacaDataProvider(None, underlying="QQQ", stock_feed="sip", cache_dir=tmp_path, offline=True)
     with pytest.raises(DataUnavailable, match="offline"):
         provider.minute_bars(TradingDay(dt.date(2026, 11, 20)))
+
+
+def test_proxy_auth_mode_sends_no_key_headers(monkeypatch):
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+    monkeypatch.setenv("APCA_AUTH_MODE", "proxy")
+    sess = RecordingSession([FakeResponse(200, {"is_open": False})])
+    c = AlpacaClient.from_env(session=sess)
+    c.clock()
+    assert c.auth == "proxy" and c.trading_base_url == PAPER_TRADING_BASE_URL
+    assert "APCA-API-KEY-ID" not in sess.calls[0]["headers"] and "APCA-API-SECRET-KEY" not in sess.calls[0]["headers"]
+    monkeypatch.setenv("APCA_AUTH_MODE", "bogus")
+    with pytest.raises(MissingCredentialsError):
+        AlpacaClient.from_env()

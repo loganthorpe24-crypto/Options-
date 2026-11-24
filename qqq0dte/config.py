@@ -79,6 +79,8 @@ class DataSettings:
     cache_dir: str = "data_cache"
     strike_grid_fallback: float | None = 1.0
     max_bar_gap_minutes: int = 5
+    calendar_source: str = "alpaca"
+    strike_source: str = "alpaca_contracts"
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,8 @@ CHOICES: dict[tuple[str, str], set[str]] = {
     ("data", "stock_feed"): {"sip", "iex", "delayed_sip"},
     ("data", "live_stock_feed"): {"sip", "iex", "delayed_sip"},
     ("data", "option_feed"): {"indicative", "opra"},
+    ("data", "calendar_source"): {"alpaca", "pandas_market_calendars"},
+    ("data", "strike_source"): {"alpaca_contracts", "grid"},
     ("data", "adjustment"): {"raw", "split", "dividend", "all"},
 }
 
@@ -144,6 +148,8 @@ ASSUMPTION_NOTES: dict[str, str] = {
     "assumptions.early_close_policy": "Half days (1pm close) can't fit the 3:45 exit or the 2:00 window, so they are skipped.",
     "data.strike_grid_fallback": "If Alpaca lists no contracts for a past expiry, assume this strike spacing ($). The contract must still have real trade bars.",
     "data.max_bar_gap_minutes": "If the newest QQQ bar at a check / trailing-stop minute is older than this, it's a data error (no stale prices).",
+    "data.calendar_source": "Trading days / half days: Alpaca /v2/calendar, or the NYSE calendar from the pandas_market_calendars package.",
+    "data.strike_source": "Strike list: Alpaca /v2/options/contracts, or a grid of data.strike_grid_fallback spacing (the contract must still have real Alpaca trade bars).",
     "data.stock_feed": "Alpaca stock feed for backtest bars (sip = consolidated tape).",
     "data.live_stock_feed": "Alpaca stock feed for the runner (free plans: iex; IEX volume makes VWAP differ from SIP).",
     "runner.late_check_tolerance_seconds": "Checks the runner evaluates later than this are replay-only. If one was the first signal, no trade.",
@@ -236,6 +242,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("strike_offset must be >= 0 (choose itm or otm for direction)")
     if cfg.data.strike_grid_fallback is not None and cfg.data.strike_grid_fallback <= 0:
         raise ConfigError("data.strike_grid_fallback must be > 0 or null")
+    if cfg.data.strike_source == "grid" and not cfg.data.strike_grid_fallback:
+        raise ConfigError("data.strike_source: grid needs data.strike_grid_fallback set to the strike spacing")
 
 
 def load_config(path: str | Path | None = "config.yaml") -> Config:
