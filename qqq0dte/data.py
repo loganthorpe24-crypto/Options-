@@ -134,11 +134,6 @@ def _read_daily(path: Path) -> pd.DataFrame:
     return df[DAILY_COLUMNS].astype(float)
 
 
-def _not_recent(end: pd.Timestamp) -> pd.Timestamp:
-    """Historical requests never reach into the last 16 minutes: free Alpaca plans may not query recent SIP data."""
-    return min(end, now_et().floor("min") - pd.Timedelta(minutes=16))
-
-
 def nyse_calendar_year(year: int) -> list[TradingDay]:
     """NYSE sessions (incl. 1pm half days and one-off closures) from the pandas_market_calendars package."""
     try:
@@ -223,6 +218,11 @@ class AlpacaDataProvider(MarketDataProvider):
     def _today(self) -> dt.date:
         return self._fixed_today or now_et().date()
 
+    def _not_recent(self, end: pd.Timestamp) -> pd.Timestamp:
+        """Historical requests never reach into the last 16 minutes: free Alpaca plans may not query recent SIP data."""
+        now = et_timestamp(self._fixed_today, "00:00") if self._fixed_today else now_et().floor("min")
+        return min(end, now - pd.Timedelta(minutes=16))
+
     def _require_online(self, what: str, path: Path) -> None:
         if self.offline:
             raise DataUnavailable(
@@ -272,7 +272,7 @@ class AlpacaDataProvider(MarketDataProvider):
             return _read_bars(path)
         self._require_online(f"1-minute {self.underlying} bars for {day.date}", path)
         raw = self.client.stock_bars(
-            self.underlying, "1Min", day.open_ts, _not_recent(day.close_ts), feed=self.stock_feed, adjustment=self.adjustment
+            self.underlying, "1Min", day.open_ts, self._not_recent(day.close_ts), feed=self.stock_feed, adjustment=self.adjustment
         )
         bars = regular_session(bars_from_alpaca(raw), day)
         if bars.empty:
@@ -311,7 +311,7 @@ class AlpacaDataProvider(MarketDataProvider):
                     self.underlying,
                     "1Day",
                     et_timestamp(month_start, "00:00"),
-                    _not_recent(et_timestamp(month_end, "23:59")),
+                    self._not_recent(et_timestamp(month_end, "23:59")),
                     feed=self.stock_feed,
                     adjustment=self.adjustment,
                 )
